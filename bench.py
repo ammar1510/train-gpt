@@ -23,7 +23,7 @@ REMOTE_TRACE_DIR = "/traces"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
-        "jax[cuda12]==0.10.0",
+        "jax[cuda13]==0.9.2",
         "optax==0.2.8",
         "numpy==2.4.5",
         "chex==0.1.91",
@@ -103,13 +103,38 @@ def run_bench(
     n_params = param_count(params)
     dummy = jnp.zeros((batch_size, cfg.seq_len), dtype=jnp.int32)
 
+    import subprocess
+    from pathlib import Path as _Path
+
+    def _cuda_version() -> str:
+        # Prefer the version file shipped with the CUDA runtime.
+        for p in ("/usr/local/cuda/version.json", "/usr/local/cuda/version.txt"):
+            try:
+                txt = _Path(p).read_text()
+                if p.endswith(".json"):
+                    import json as _json
+                    return _json.loads(txt).get("cuda", {}).get("version", txt.strip())
+                return txt.strip().split("\n")[0]
+            except FileNotFoundError:
+                pass
+        # Fall back to nvidia-smi.
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True,
+        )
+        return f"driver {r.stdout.strip()}" if r.returncode == 0 else "unknown"
+
+    cuda_ver = _cuda_version()
+
     results: dict = {
         "config": config,
         "n_params": n_params,
         "batch_size": batch_size,
         "seq_len": cfg.seq_len,
         "device": str(jax.devices()[0]),
+        "device_kind": jax.devices()[0].device_kind,
         "backend": jax.default_backend(),
+        "cuda_version": cuda_ver,
     }
 
     fwd_jit = jax.jit(lambda p, x: cross_entropy_loss(p, x, x, cfg))
@@ -209,6 +234,8 @@ def main(
     print(f"  device     : {r['device']}")
     print(f"  peak ref   : {peak_tflops:,.0f} TFLOP/s  (BF16 dense)")
     print(f"  jax backend: {r['backend']}")
+    print(f"  device kind: {r['device_kind']}")
+    print(f"  cuda       : {r['cuda_version']}")
     print(f"{'─' * 55}")
 
     def row(label, d):
@@ -232,3 +259,4 @@ def main(
                 f.write(chunk)
         print(f"Perfetto trace saved to: {local_path.resolve()}")
         print("Open at: https://ui.perfetto.dev  (drag-and-drop the file)")
+
