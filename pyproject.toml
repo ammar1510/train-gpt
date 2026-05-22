@@ -1,0 +1,19 @@
+[project]
+name = "train-gpt"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "chex>=0.1.91",
+    "datasets>=4.8.5",
+    "jax>=0.10.0",
+    "modal>=1.4.3",
+    "numpy>=2.4.5",
+    "optax>=0.2.8",
+    "tiktoken>=0.13.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "ruff>=0.15.13",
+]
