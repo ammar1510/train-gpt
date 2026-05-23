@@ -5,6 +5,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from config import Config
+from kernels import rms_norm
 
 
 def init_params(key, cfg: Config):
@@ -41,13 +42,6 @@ def init_params(key, cfg: Config):
     if not cfg.tie_embeddings:
         params["unembed"] = normal(k_out, (cfg.d_model, cfg.vocab_size))
     return params
-
-
-def rms_norm(x, scale, eps):
-    var = jnp.mean(x.astype(jnp.float32) ** 2, axis=-1, keepdims=True)
-    x = x * jax.lax.rsqrt(var + eps).astype(x.dtype)
-    return x * scale
-
 
 
 def attention(x, p, cfg: Config):

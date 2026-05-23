@@ -28,7 +28,7 @@ image = (
         "numpy==2.4.5",
         "chex==0.1.91",
     )
-    .add_local_python_source("config", "model", "losses", "train", "data")
+    .add_local_python_source("config", "model", "losses", "train", "data", "kernels")
 )
 
 app = modal.App("train-gpt-bench")
@@ -51,7 +51,20 @@ def run_bench(
     peak_tflops: float = B200_BF16_TFLOPS,
     profile: bool = False,
 ) -> dict:
+    import os
     import time
+
+    hlo_dump_dir = "/tmp/hlo-dump"
+    # Set before JAX initializes so XLA picks it up.
+    xla_flags = ["--xla_gpu_enable_triton_gemm=false"]
+    if profile:
+        os.makedirs(hlo_dump_dir, exist_ok=True)
+        xla_flags += [
+            f"--xla_dump_to={hlo_dump_dir}",
+            "--xla_dump_hlo_as_text",
+            "--xla_dump_hlo_pass_re=.*",
+        ]
+    os.environ["XLA_FLAGS"] = " ".join(xla_flags)
 
     import jax
     import jax.numpy as jnp
@@ -205,6 +218,17 @@ def run_bench(
         else:
             print("warning: no trace file found")
 
+        # Bundle the HLO dumps into a tarball next to the trace.
+        hlo_src = _Path(hlo_dump_dir)
+        if hlo_src.exists() and any(hlo_src.iterdir()):
+            tar_path = _Path(REMOTE_TRACE_DIR) / "hlo_dump.tar.gz"
+            shutil.make_archive(str(tar_path).removesuffix(".tar.gz"), "gztar", hlo_src)
+            trace_vol.commit()
+            results["hlo_dump_name"] = tar_path.name
+            print(f"hlo dump saved to volume: {tar_path.name}  ({tar_path.stat().st_size / 1024:.1f} KB)")
+        else:
+            print("warning: no hlo dump files found")
+
     return results
 
 
@@ -236,6 +260,7 @@ def main(
     print(f"  jax backend: {r['backend']}")
     print(f"  device kind: {r['device_kind']}")
     print(f"  cuda       : {r['cuda_version']}")
+    print(f"  gemm backend: cuBLAS (triton disabled)")
     print(f"{'─' * 55}")
 
     def row(label, d):
@@ -259,4 +284,14 @@ def main(
                 f.write(chunk)
         print(f"Perfetto trace saved to: {local_path.resolve()}")
         print("Open at: https://ui.perfetto.dev  (drag-and-drop the file)")
+
+    if "hlo_dump_name" in r:
+        fname = r["hlo_dump_name"]
+        local_path = Path(fname)
+        print(f"downloading hlo dump from volume ...")
+        with open(local_path, "wb") as f:
+            for chunk in trace_vol.read_file(fname):
+                f.write(chunk)
+        print(f"HLO dump saved to: {local_path.resolve()}")
+        print(f"Extract with: tar -xzf {local_path.name} -C hlo-dump/")
 
