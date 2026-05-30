@@ -19,13 +19,15 @@ def init_params(key, cfg: Config):
     layer_keys = jax.random.split(k_layers, cfg.n_layers)
 
     def init_layer(lk):
-        k_qkv, k_o, k_up, k_down, k_n1, k_n2 = jax.random.split(lk, 6)
+        k_q, k_k, k_v, k_o, k_up, k_down = jax.random.split(lk, 6)
         d = cfg.d_model
-        qkv_out = 3 * cfg.n_heads * cfg.head_dim
+        h_out = cfg.n_heads * cfg.head_dim
         return {
             "norm1": jnp.ones((d,), dtype=cfg.dtype),
-            "wqkv": normal(k_qkv, (d, qkv_out)),
-            "wo": normal(k_o, (cfg.n_heads * cfg.head_dim, d), s=proj_std),
+            "wq": normal(k_q, (d, h_out)),
+            "wk": normal(k_k, (d, h_out)),
+            "wv": normal(k_v, (d, h_out)),
+            "wo": normal(k_o, (h_out, d), s=proj_std),
             "norm2": jnp.ones((d,), dtype=cfg.dtype),
             "w_up": normal(k_up, (d, cfg.d_ff)),
             "w_down": normal(k_down, (cfg.d_ff, d), s=proj_std),
@@ -45,16 +47,17 @@ def init_params(key, cfg: Config):
 
 
 def attention(x, p, cfg: Config):
-    B, T, D = x.shape
+    B, T, _ = x.shape
     H, Dh = cfg.n_heads, cfg.head_dim
-    qkv = x @ p["wqkv"]
-    qkv = qkv.reshape(B, T, 3, H, Dh)
-    q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
-    # dot_product_attention expects (B, T, H, Dh) — no transpose needed
+    # Three separate projections so each output is already contiguous (B,T,H,Dh)
+    # for cuDNN flash-attention — avoids the strided slice/transpose around a
+    # packed wqkv matmul (~57ms / 4.3% of GPU time on the prior trace).
+    q = (x @ p["wq"]).reshape(B, T, H, Dh)
+    k = (x @ p["wk"]).reshape(B, T, H, Dh)
+    v = (x @ p["wv"]).reshape(B, T, H, Dh)
     impl = "cudnn" if jax.default_backend() == "gpu" else "xla"
     out = jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation=impl)
-    out = out.reshape(B, T, H * Dh)
-    return out @ p["wo"]
+    return out.reshape(B, T, H * Dh) @ p["wo"]
 
 
 def mlp(x, p):
@@ -71,6 +74,7 @@ def forward(params, input_ids, cfg: Config):
     B, T = input_ids.shape
     x = params["embed"][input_ids] + params["pos"][:T]
 
+    @jax.checkpoint
     def step(carry, layer_p):
         return block(carry, layer_p, cfg), None
 

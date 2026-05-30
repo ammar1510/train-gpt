@@ -15,7 +15,7 @@ class Config:
     dtype: jnp.dtype = jnp.bfloat16
     init_std: float = 0.02
     rms_eps: float = 1e-5
-    tie_embeddings: bool = True
+    tie_embeddings: bool = False
     logit_cap: float = 15.0
 
 

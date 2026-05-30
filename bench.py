@@ -44,7 +44,7 @@ trace_vol = modal.Volume.from_name(TRACE_VOLUME_NAME, create_if_missing=True)
 )
 def run_bench(
     config: str = "full",
-    batch_size: int = 4,
+    batch_size: int = 8,
     warmup: int = 5,
     steps: int = 20,
     fwd_only: bool = False,
@@ -56,6 +56,7 @@ def run_bench(
 
     hlo_dump_dir = "/tmp/hlo-dump"
     # Set before JAX initializes so XLA picks it up.
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
     xla_flags = ["--xla_gpu_enable_triton_gemm=false"]
     if profile:
         os.makedirs(hlo_dump_dir, exist_ok=True)
@@ -167,7 +168,7 @@ def run_bench(
         opt_state = optimizer.init(params)
         train_step = make_train_step(cfg, optimizer)
         print("compiling fwd+bwd ...")
-        params, opt_state, _ = train_step(params, opt_state, dummy, dummy)
+        params, opt_state, _, _ = train_step(params, opt_state, dummy, dummy)
 
         dt_step = timed_run(
             lambda: train_step(params, opt_state, dummy, dummy),
@@ -235,7 +236,7 @@ def run_bench(
 @app.local_entrypoint()
 def main(
     config: str = "full",
-    batch_size: int = 4,
+    batch_size: int = 8,
     warmup: int = 5,
     steps: int = 20,
     fwd_only: bool = False,

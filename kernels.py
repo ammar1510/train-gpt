@@ -67,8 +67,11 @@ def _build_gpu_rms_norm():
 
         # Mosaic GPU requires 2D SMEM buffers — 1D raises WGStridedFragLayout
         # errors even at valid sizes. Scalar loads (var_ref[0, 0]) work; tensor
-        # slices (var_ref[:, 0]) do not. Grid is (N, N_TILES): one row per call,
-        # so we only ever need one scalar per invocation.
+        # slices (var_ref[:, 0]) do not.
+        # Grid is flattened to 1D so only blockIdx.x (limit 2^31-1) is used; the
+        # 65,535 cap on blockIdx.y/z applies for any multi-axis grid mapping and
+        # the Mosaic→CUDA axis mapping is not guaranteed by Pallas. Row and
+        # tile indices are recovered with divmod inside the BlockSpec lambdas.
         # Pad to (N, 32): block (1, 32) = 128 bytes satisfies all four TMA rules.
         var32 = jnp.tile(var[:, None], (1, 32))   # (N, 32) float32
 
@@ -78,12 +81,12 @@ def _build_gpu_rms_norm():
             functools.partial(_norm_kernel, eps=eps),
             out_shape=jax.ShapeDtypeStruct(x2d.shape, x2d.dtype),
             in_specs=[
-                pl.BlockSpec((1, TILE_D), lambda i, j: (i, j * TILE_D)),  # x
-                pl.BlockSpec((1, TILE_D), lambda i, j: (0, j * TILE_D)),  # scale
-                pl.BlockSpec((1, 32),     lambda i, j: (i, 0)),           # var
+                pl.BlockSpec((1, TILE_D), lambda p: (p // N_TILES, (p % N_TILES) * TILE_D)),  # x
+                pl.BlockSpec((1, TILE_D), lambda p: (0, (p % N_TILES) * TILE_D)),             # scale
+                pl.BlockSpec((1, 32),     lambda p: (p // N_TILES, 0)),                       # var
             ],
-            out_specs=pl.BlockSpec((1, TILE_D), lambda i, j: (i, j * TILE_D)),
-            grid=(N, N_TILES),
+            out_specs=pl.BlockSpec((1, TILE_D), lambda p: (p // N_TILES, (p % N_TILES) * TILE_D)),
+            grid=(N * N_TILES,),
         )(x2d, scale_2d, var32)
 
         return out2d.reshape(orig)
