@@ -55,6 +55,13 @@ def _fp8_forward(a: jax.Array, b: jax.Array, block_k: int) -> jax.Array:
     if K % block_k != 0:
         raise ValueError(f"K={K} not divisible by block_k={block_k}")
 
+    # NOTE: on B200 there is a real miscompile when the Pallas rms_norm kernel
+    # and jax.nn.scaled_matmul live in the SAME XLA program -- the rms_norm
+    # output comes back NaN (confirmed in debug_fp8.bridge). It is NOT fixable
+    # with jax.lax.optimization_barrier (the corruption is module-level codegen,
+    # not fusion reordering that a barrier can block): only a separate XLA
+    # program, or the pure-XLA rms_norm path, avoids it. Callers that mix this op
+    # with rms_norm must use the pure-XLA rms_norm. Independent of JAX 0.9.2/0.10.
     a_2d = a.reshape(-1, K)
     a_f8, a_scales = _quantize_to_fp8(a_2d.astype(jnp.float32), block_k)
     # scaled_matmul expects rhs as (B, N, K) — transpose b from (K, N).
@@ -67,6 +74,7 @@ def _fp8_forward(a: jax.Array, b: jax.Array, block_k: int) -> jax.Array:
         b_scales[None],   # (1, N, K/block_k)
         preferred_element_type=jnp.float32,
     )[0]                  # (M, N)
+    out_f32 = jax.lax.optimization_barrier(out_f32)
     return out_f32.astype(jnp.bfloat16).reshape(*leading, N)
 
 

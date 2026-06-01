@@ -5,7 +5,15 @@ import jax.numpy as jnp
 from jax import lax
 
 from config import Config
-from kernels import rms_norm
+from kernels import rms_norm, _rms_norm_pure
+
+
+def _norm(x, w, cfg: Config):
+    """rms_norm dispatch: custom Pallas kernel vs pure-XLA fallback (cfg flag).
+    The Pallas kernel has miscompiled on B200 in some graph shapes, so this lets
+    callers fall back to the XLA implementation."""
+    fn = rms_norm if cfg.use_pallas_norm else _rms_norm_pure
+    return fn(x, w, cfg.rms_eps)
 
 
 def init_params(key, cfg: Config):
@@ -65,8 +73,8 @@ def mlp(x, p):
 
 
 def block(x, p, cfg: Config):
-    x = x + attention(rms_norm(x, p["norm1"], cfg.rms_eps), p, cfg)
-    x = x + mlp(rms_norm(x, p["norm2"], cfg.rms_eps), p)
+    x = x + attention(_norm(x, p["norm1"], cfg), p, cfg)
+    x = x + mlp(_norm(x, p["norm2"], cfg), p)
     return x
 
 
@@ -74,12 +82,15 @@ def forward(params, input_ids, cfg: Config):
     B, T = input_ids.shape
     x = params["embed"][input_ids] + params["pos"][:T]
 
-    @jax.checkpoint
     def step(carry, layer_p):
         return block(carry, layer_p, cfg), None
 
-    x, _ = lax.scan(step, x, params["layers"])
-    x = rms_norm(x, params["final_norm"], cfg.rms_eps)
+    # Activation checkpointing is opt-out via cfg.use_remat: rematerialize each
+    # block in the backward pass (low HBM, +1 forward recompute) vs. keep all
+    # per-layer activations live (faster, higher HBM).
+    scan_step = jax.checkpoint(step) if cfg.use_remat else step
+    x, _ = lax.scan(scan_step, x, params["layers"])
+    x = _norm(x, params["final_norm"], cfg)
 
     w_out = params["embed"].T if cfg.tie_embeddings else params["unembed"]
     logits = x @ w_out

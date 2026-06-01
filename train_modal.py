@@ -75,7 +75,11 @@ def run_train(
     config: str = "full",
     batch_size: int = 8,
     n_steps: int = 5000,
+    total_steps: int = 0,
     lr: float = 1e-4,
+    warmup_steps: int = 200,
+    lr_schedule: str = "cosine",
+    lr_end_frac: float = 0.1,
     weight_decay: float = 0.1,
     clip_norm: float = 1.0,
     log_every: int = 50,
@@ -83,12 +87,19 @@ def run_train(
     seed: int = 0,
     peak_tflops: float = B200_BF16_TFLOPS,
     resume_from: str = "",
+    use_remat: bool = True,
+    use_pallas_norm: bool = False,
+    gpu_sample_ms: int = 500,
 ) -> dict:
     import os
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
     os.environ["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
 
+    import dataclasses
     import math
+    import statistics
+    import subprocess
+    import tempfile
     import time
 
     import jax
@@ -99,9 +110,15 @@ def run_train(
     from data import batch_iter, load_tokens, synth_bin
     from losses import cross_entropy_loss
     from model import init_params, param_count
-    from train import make_optimizer, make_train_step
+    from train import make_lr_schedule, make_optimizer, make_train_step
 
     cfg = SMALL if config == "small" else Config()
+    # use_remat: low HBM (+recompute) vs faster/higher-memory.
+    # use_pallas_norm defaults False: the Pallas rms_norm kernel NaNs at batch
+    # >=64 on B200 (see memory: batch128-bf16-divergence) — pure-XLA is safe.
+    cfg = dataclasses.replace(
+        cfg, use_remat=use_remat, use_pallas_norm=use_pallas_norm
+    )
 
     # --- FLOP / MFU helpers (copied from bench.py for comparable numbers) ---
     def estimate_flops(cfg: Config, batch_size: int) -> float:
@@ -123,6 +140,124 @@ def run_train(
             )
         except Exception:
             return (0.0, 0.0)
+
+    # --- GPU telemetry sampler (copied verbatim from bench.py so the SM-clock /
+    # power readings are directly comparable to a `modal run bench.py` run). The
+    # point of running it here: bench sits clamped at the ~1155 MHz base clock
+    # and draws ~590 W, while training is observed near the ~1000 W cap. Sampling
+    # the *training* SM clock settles whether training boosts (power-bound) or is
+    # also clock-clamped. nvidia-smi queries NVML on a separate process, not the
+    # CUDA path, so it does not perturb the JAX loop. ---
+    class _GpuSampler:
+        """Polls nvidia-smi in the background for clock/power/throttle state.
+
+        Degrades to a no-op (returns {}) if nvidia-smi is unavailable.
+        """
+
+        # Order matters: parsing indexes into this list.
+        _FIELDS = [
+            "clocks.sm",                                       # 0 current SM clock
+            "clocks.max.sm",                                   # 1 max supported
+            "temperature.gpu",                                 # 2
+            "power.draw",                                      # 3
+            "power.limit",                                     # 4 enforced cap
+            "clocks_throttle_reasons.sw_power_cap",            # 5
+            "clocks_throttle_reasons.sw_thermal_slowdown",     # 6
+            "clocks_throttle_reasons.hw_thermal_slowdown",     # 7
+            "clocks_throttle_reasons.hw_power_brake_slowdown",  # 8
+        ]
+
+        def __init__(self, interval_ms: int = 500):
+            self._interval_ms = interval_ms
+            self._proc = None
+            self._tmp = None
+
+        def start(self) -> None:
+            if self._interval_ms <= 0:
+                return
+            try:
+                self._tmp = tempfile.NamedTemporaryFile(
+                    mode="w+", suffix=".csv", delete=False
+                )
+                self._proc = subprocess.Popen(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=" + ",".join(self._FIELDS),
+                        "--format=csv,noheader,nounits",
+                        "-lms", str(self._interval_ms),
+                    ],
+                    stdout=self._tmp,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (FileNotFoundError, OSError):
+                # No nvidia-smi (e.g. CPU host) — sampling silently disabled.
+                self._proc = None
+
+        def stop(self) -> dict:
+            if self._proc is None or self._tmp is None:
+                return {}
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+
+            self._tmp.flush()
+            self._tmp.seek(0)
+            rows = []
+            for line in self._tmp:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == len(self._FIELDS):
+                    rows.append(parts)
+            self._tmp.close()
+            try:
+                os.unlink(self._tmp.name)
+            except OSError:
+                pass
+            if not rows:
+                return {}
+
+            def col_floats(idx):
+                out = []
+                for r in rows:
+                    try:
+                        out.append(float(r[idx]))
+                    except ValueError:
+                        pass
+                return out
+
+            sm = col_floats(0)
+            sm_cap = col_floats(1)
+            temp = col_floats(2)
+            draw = col_floats(3)
+            lim = col_floats(4)
+
+            # Fraction of samples in which each throttle reason was Active.
+            reasons = {}
+            for i, name in enumerate(self._FIELDS):
+                if not name.startswith("clocks_throttle_reasons."):
+                    continue
+                active = sum(1 for r in rows if r[i].lower().startswith("active"))
+                frac = active / len(rows)
+                if frac > 0:
+                    reasons[name.split(".")[-1]] = round(frac, 3)
+
+            return {
+                "samples": len(rows),
+                "sm_clock_mhz": (
+                    {"min": min(sm), "max": max(sm),
+                     "mean": round(statistics.fmean(sm), 1)}
+                    if sm else {}
+                ),
+                "sm_clock_cap_mhz": max(sm_cap) if sm_cap else None,
+                "temp_c_max": max(temp) if temp else None,
+                "power_w": (
+                    {"max_draw": max(draw), "limit": max(lim),
+                     "mean_draw": round(statistics.fmean(draw), 1)}
+                    if draw and lim else {}
+                ),
+                "throttle_active_frac": reasons,
+            }
 
     # --- corpus selection: real text for FULL, synth fallback for SMALL ---
     real_data_path = Path(REMOTE_DATA_DIR) / REAL_TOKENS_FILE
@@ -162,9 +297,45 @@ def run_train(
         print(f"resumed from {resume_from} at step {start_step}")
 
     n_params = param_count(params)
-    print(f"params: {n_params:,}  (bf16)")
+    print(f"params: {n_params:,}  (bf16)  use_remat={use_remat}")
 
-    optimizer = make_optimizer(lr, weight_decay, clip_norm)
+    # LR schedule: warmup -> decay (default cosine to 10% of peak). A constant
+    # LR only orbits the minimum and plateaus; see make_lr_schedule docstring.
+    #
+    # `total_steps` is the FULL decay horizon, which may span multiple resumed
+    # chunks; `n_steps` is only what THIS process runs. They differ when a run
+    # longer than Modal's 24h timeout is split into chunks: the cosine then
+    # spans the whole corpus, not each chunk. Defaults to n_steps (single run).
+    horizon = total_steps if total_steps > 0 else n_steps
+    if horizon < start_step + n_steps:
+        raise ValueError(
+            f"total_steps ({horizon}) must be >= start_step + n_steps "
+            f"({start_step + n_steps}); the schedule would end before the run does"
+        )
+    base_sched = make_lr_schedule(
+        lr, horizon, warmup_steps=warmup_steps,
+        end_lr_frac=lr_end_frac, kind=lr_schedule,
+    )
+    # adamw indexes the schedule by THIS process's optimizer count (0-based), so
+    # on resume we shift by start_step to keep one continuous curve across
+    # chunks. Off by the single pre-loop warmup update — negligible over 1e4+
+    # steps. `base_sched` (un-shifted, global) drives the logged LR readout.
+    if callable(base_sched) and start_step > 0:
+        def opt_sched(local_count):
+            return base_sched(local_count + start_step)
+    else:
+        opt_sched = base_sched
+
+    def lr_at(global_step: int) -> float:
+        return float(base_sched(global_step)) if callable(base_sched) else float(base_sched)
+
+    print(
+        f"lr schedule: {lr_schedule} peak={lr:.2e} warmup={warmup_steps} "
+        f"end={lr * lr_end_frac:.2e} over {horizon} steps "
+        f"(this chunk: {start_step + 1}..{start_step + n_steps})"
+    )
+
+    optimizer = make_optimizer(opt_sched, weight_decay, clip_norm)
     opt_state = optimizer.init(params)
     train_step = make_train_step(cfg, optimizer)
 
@@ -202,6 +373,10 @@ def run_train(
         )
 
     history = []  # (step, loss, grad_norm) for the returned summary
+    # Start GPU telemetry only now, after compile+warmup, so the clock/power
+    # stats reflect steady-state training and not the (idle-ish) compile phase.
+    gpu_sampler = _GpuSampler(gpu_sample_ms)
+    gpu_sampler.start()
     t0 = time.perf_counter()
     last_log_t, last_log_step = t0, 0
     peak_mfu = 0.0
@@ -233,7 +408,8 @@ def run_train(
             done = step - start_step
             eta_s = (n_steps - done) * step_time
             print(f"step {step:6d}  loss {loss_val:7.4f}  "
-                  f"grad_norm {gn_val:7.3f}  {tps:>10,.0f} tok/s  "
+                  f"grad_norm {gn_val:7.3f}  lr {lr_at(step):.2e}  "
+                  f"{tps:>10,.0f} tok/s  "
                   f"MFU {cur_mfu * 100:4.1f}%  ETA {eta_s / 60:5.1f}m")
             history.append((step, loss_val, gn_val))
             last_log_t, last_log_step = now, step
@@ -244,6 +420,7 @@ def run_train(
 
     jax.block_until_ready(loss)
     total_dt = time.perf_counter() - t0
+    gpu_telemetry = gpu_sampler.stop()
     final_step = start_step + n_steps
 
     final_ckpt = ""
@@ -272,6 +449,7 @@ def run_train(
         "peak_mfu": peak_mfu,
         "hbm_peak_gb": used_gb,
         "hbm_limit_gb": limit_gb,
+        "gpu_telemetry": gpu_telemetry,
         "final_loss": history[-1][1] if history else warmup_loss,
         "final_grad_norm": history[-1][2] if history else None,
         "final_checkpoint": final_ckpt,
@@ -284,7 +462,11 @@ def main(
     config: str = "full",
     batch_size: int = 8,
     n_steps: int = 5000,
+    total_steps: int = 0,
     lr: float = 1e-4,
+    warmup_steps: int = 200,
+    lr_schedule: str = "cosine",
+    lr_end_frac: float = 0.1,
     weight_decay: float = 0.1,
     clip_norm: float = 1.0,
     log_every: int = 50,
@@ -292,12 +474,19 @@ def main(
     seed: int = 0,
     peak_tflops: float = B200_BF16_TFLOPS,
     resume_from: str = "",
+    use_remat: bool = True,
+    use_pallas_norm: bool = False,
+    gpu_sample_ms: int = 500,
 ):
     r = run_train.remote(
         config=config,
         batch_size=batch_size,
         n_steps=n_steps,
+        total_steps=total_steps,
         lr=lr,
+        warmup_steps=warmup_steps,
+        lr_schedule=lr_schedule,
+        lr_end_frac=lr_end_frac,
         weight_decay=weight_decay,
         clip_norm=clip_norm,
         log_every=log_every,
@@ -305,6 +494,9 @@ def main(
         seed=seed,
         peak_tflops=peak_tflops,
         resume_from=resume_from,
+        use_remat=use_remat,
+        use_pallas_norm=use_pallas_norm,
+        gpu_sample_ms=gpu_sample_ms,
     )
 
     print(f"\n{'─' * 60}")
@@ -321,6 +513,23 @@ def main(
     print(f"  MFU         : {r['avg_mfu'] * 100:.1f}% avg   "
           f"{r['peak_mfu'] * 100:.1f}% peak")
     print(f"  HBM peak    : {r['hbm_peak_gb']:.1f} / {r['hbm_limit_gb']:.1f} GB")
+    t = r.get("gpu_telemetry") or {}
+    sm = t.get("sm_clock_mhz") or {}
+    pw = t.get("power_w") or {}
+    cap = t.get("sm_clock_cap_mhz")
+    if sm and pw:
+        clk = (f"SM {sm['min']:.0f}–{sm['max']:.0f} MHz (mean {sm['mean']:.0f}, "
+               f"cap {cap:.0f})" if cap else f"SM {sm['min']:.0f}–{sm['max']:.0f} MHz")
+        print(f"  gpu state   : {clk}")
+        print(f"                {t.get('temp_c_max', 0):.0f}°C, "
+              f"mean {pw['mean_draw']:.0f} / max {pw['max_draw']:.0f} / "
+              f"limit {pw['limit']:.0f} W   ({t['samples']} samples)")
+        reasons = t.get("throttle_active_frac") or {}
+        if reasons:
+            flags = "  ".join(f"{k} {v:.0%}" for k, v in reasons.items())
+            print(f"                ⚠ throttle active: {flags}")
+        else:
+            print(f"                ✓ no throttle flags raised")
     print(f"  final loss  : {r['final_loss']:.4f}")
     if r["final_grad_norm"] is not None:
         print(f"  final |g|   : {r['final_grad_norm']:.3f}")

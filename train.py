@@ -32,9 +32,91 @@ from losses import cross_entropy_loss
 from model import init_params, param_count
 
 
-def make_optimizer(lr: float, weight_decay: float, clip_norm: float):
+def make_lr_schedule(
+    peak_lr: float,
+    n_steps: int,
+    warmup_steps: int = 0,
+    end_lr_frac: float = 1.0,
+    kind: str = "cosine",
+):
+    """Build a learning-rate schedule (or a bare float) for `make_optimizer`.
+
+    Why this exists: a *constant* LR does not converge to the minimum — it
+    settles into a noisy orbit whose radius scales with the LR, so the loss
+    plateaus and bounces (observed: bf16 batch-128 parked at ~6.1 from step 300
+    onward, clip firing every step). Decaying the LR collapses that orbit so the
+    loss can actually settle; a short warmup avoids the cold-init gradient spike
+    that, at full LR from step 0, lands the model in a poor basin.
+
+    Returns:
+      - a plain float when no shaping is requested (kind="constant",
+        warmup_steps=0) — byte-for-byte the previous behaviour, so existing
+        callers are unaffected; or
+      - an optax schedule callable (step -> lr) that `optax.adamw` consumes
+        natively.
+
+    Args:
+      peak_lr:      LR at the end of warmup / start of decay (e.g. 4e-4).
+      n_steps:      total optimizer steps this run (the decay horizon).
+      warmup_steps: linear ramp 0 -> peak_lr over these steps.
+      end_lr_frac:  final LR as a fraction of peak (e.g. 0.1 -> decay to 10%).
+      kind:         "cosine" | "linear" | "constant".
+
+    Caveat for resumed runs: optax schedules index from the optimizer's own step
+    counter, which restarts at 0 each process. This run does not restore Adam
+    moments on resume either, so a resumed run should pass n_steps = remaining
+    steps (and usually warmup_steps=0) rather than the original full horizon.
+    """
+    # Fail fast on bad inputs — a malformed schedule silently wastes a
+    # multi-hour, multi-dollar run rather than erroring at launch.
+    if peak_lr <= 0:
+        raise ValueError(f"peak_lr must be > 0, got {peak_lr}")
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be > 0, got {n_steps}")
+    if not (0 <= warmup_steps < n_steps):
+        raise ValueError(
+            f"warmup_steps must be in [0, n_steps={n_steps}), got {warmup_steps}"
+        )
+    if not (0.0 <= end_lr_frac <= 1.0):
+        raise ValueError(f"end_lr_frac must be in [0, 1], got {end_lr_frac}")
+
+    if kind == "constant":
+        if warmup_steps == 0:
+            return peak_lr  # exact previous behaviour
+        return optax.join_schedules(
+            [optax.linear_schedule(0.0, peak_lr, warmup_steps),
+             optax.constant_schedule(peak_lr)],
+            boundaries=[warmup_steps],
+        )
+
+    end_value = peak_lr * end_lr_frac
+    if kind == "cosine":
+        # decay_steps is the TOTAL horizon; optax runs linear warmup over
+        # warmup_steps then cosine-decays peak->end over the remainder.
+        return optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=peak_lr,
+            warmup_steps=warmup_steps,
+            decay_steps=n_steps,
+            end_value=end_value,
+        )
+    if kind == "linear":
+        decay = optax.linear_schedule(peak_lr, end_value, n_steps - warmup_steps)
+        if warmup_steps == 0:
+            return decay
+        return optax.join_schedules(
+            [optax.linear_schedule(0.0, peak_lr, warmup_steps), decay],
+            boundaries=[warmup_steps],
+        )
+    raise ValueError(f"unknown schedule kind {kind!r}; use cosine|linear|constant")
+
+
+def make_optimizer(lr, weight_decay: float, clip_norm: float):
     """AdamW with global-norm grad clipping. Clipping is required for stability
-    on cold init — see module docstring."""
+    on cold init — see module docstring.
+
+    `lr` may be a float OR an optax schedule (callable step -> lr); adamw
+    consumes both. Use `make_lr_schedule` to build a warmup+decay schedule."""
     return optax.chain(
         optax.clip_by_global_norm(clip_norm),
         optax.adamw(learning_rate=lr, weight_decay=weight_decay),
