@@ -17,8 +17,11 @@ Run (does NOT execute automatically — you launch it):
     modal run train_modal.py --n-steps 5000 --batch-size 8 --lr 1e-4
     modal run train_modal.py --config small        # synth-data smoke test
 
-Resume from a checkpoint on the volume:
-    modal run train_modal.py --resume-from step_2000.pkl --n-steps 5000
+Resume from a checkpoint on the volume (path is relative to /checkpoints; with
+per-run subdirs it is "<run_id>/step_N.pkl", and a bare "step_N.pkl" still
+resolves to a legacy flat checkpoint). Resuming READS the source checkpoint but
+WRITES new ones under a fresh run_id, so the source run is never overwritten:
+    modal run train_modal.py --resume-from run_20260601_120000/step_2000.pkl --n-steps 5000
 
 Stable defaults (see train.py docstring): grad clip 1.0, lr 1e-4, batch >= 8.
 """
@@ -52,6 +55,17 @@ image = (
 app = modal.App("train-gpt-train")
 data_vol = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
 ckpt_vol = modal.Volume.from_name(CKPT_VOLUME_NAME, create_if_missing=True)
+
+
+def _make_run_id() -> str:
+    """A filesystem-safe, sortable run id stamped at launch time.
+
+    Generated on the LOCAL entrypoint (not inside the training loop) so the
+    whole run shares one id and it shows up in the launcher output immediately.
+    """
+    import time
+
+    return time.strftime("run_%Y%m%d_%H%M%S")
 
 
 def _tree_to_numpy(tree):
@@ -90,6 +104,7 @@ def run_train(
     use_remat: bool = True,
     use_pallas_norm: bool = False,
     gpu_sample_ms: int = 500,
+    run_id: str = "",
 ) -> dict:
     import os
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
@@ -97,6 +112,7 @@ def run_train(
 
     import dataclasses
     import math
+    import re
     import statistics
     import subprocess
     import tempfile
@@ -114,11 +130,30 @@ def run_train(
 
     cfg = SMALL if config == "small" else Config()
     # use_remat: low HBM (+recompute) vs faster/higher-memory.
-    # use_pallas_norm defaults False: the Pallas rms_norm kernel NaNs at batch
-    # >=64 on B200 (see memory: batch128-bf16-divergence) — pure-XLA is safe.
+    # use_pallas_norm defaults False (pure-XLA rms_norm). The Pallas kernel's
+    # index_map NaN bug was fixed in kernels.py 2026-06-07 and is now correct,
+    # but a matched bench showed it ~2-5% SLOWER than pure-XLA with more HBM, and
+    # it can't be made faster on this stack (Mosaic has no in-kernel reductions,
+    # so the variance must be computed in XLA -> two-pass; the custom_call also
+    # blocks XLA fusion). Keep pure-XLA. See memory: pallas-default-backend-absl.
     cfg = dataclasses.replace(
         cfg, use_remat=use_remat, use_pallas_norm=use_pallas_norm
     )
+
+    # Per-run checkpoint isolation: every run writes to /checkpoints/<run_id>/,
+    # so concurrent or sequential runs can never overwrite each other's
+    # step_N.pkl files (they previously shared a flat namespace on the volume).
+    # run_id becomes a path segment, so validate it as one — reject separators
+    # and '..' to prevent escaping the checkpoint volume.
+    run_id = run_id or _make_run_id()
+    if run_id in (".", "..") or ".." in run_id or not re.fullmatch(
+        r"[A-Za-z0-9._-]+", run_id
+    ):
+        raise ValueError(
+            f"run_id must be a single safe path segment [A-Za-z0-9._-] with "
+            f"no '..'; got {run_id!r}"
+        )
+    print(f"run_id: {run_id}  (checkpoints under {REMOTE_CKPT_DIR}/{run_id}/)")
 
     # --- FLOP / MFU helpers (copied from bench.py for comparable numbers) ---
     def estimate_flops(cfg: Config, batch_size: int) -> float:
@@ -284,7 +319,18 @@ def run_train(
     params = init_params(key, cfg)
     start_step = 0
     if resume_from:
-        ckpt_path = Path(REMOTE_CKPT_DIR) / resume_from
+        # resume_from is a path RELATIVE TO /checkpoints. With per-run subdirs it
+        # normally looks like "<run_id>/step_N.pkl"; a bare "step_N.pkl" still
+        # resolves to a legacy flat checkpoint, so older runs stay resumable.
+        # We READ from here but WRITE new checkpoints under THIS run's run_id —
+        # resuming forks a new lineage and never overwrites the source run.
+        ckpt_root = Path(REMOTE_CKPT_DIR).resolve()
+        ckpt_path = (ckpt_root / resume_from).resolve()
+        # Guard against '..'/absolute paths escaping the checkpoint volume.
+        if ckpt_path != ckpt_root and ckpt_root not in ckpt_path.parents:
+            raise ValueError(
+                f"resume_from must stay within {REMOTE_CKPT_DIR}; got {resume_from!r}"
+            )
         if not ckpt_path.exists():
             raise FileNotFoundError(f"resume checkpoint not found: {ckpt_path}")
         with open(ckpt_path, "rb") as f:
@@ -294,7 +340,8 @@ def run_train(
             lambda x: jnp.asarray(x, dtype=cfg.dtype), ckpt["params"]
         )
         start_step = int(ckpt.get("step", 0))
-        print(f"resumed from {resume_from} at step {start_step}")
+        print(f"resumed from {resume_from} at step {start_step} "
+              f"→ new checkpoints fork under {run_id}/")
 
     n_params = param_count(params)
     print(f"params: {n_params:,}  (bf16)  use_remat={use_remat}")
@@ -344,19 +391,26 @@ def run_train(
     flops_per_step = estimate_flops(cfg, batch_size)
 
     def save_ckpt(params, step: int) -> str:
-        """Pickle a host-side numpy copy of params to the checkpoint volume."""
+        """Pickle a host-side numpy copy of params to /checkpoints/<run_id>/.
+
+        Returns the path relative to the volume root ("<run_id>/step_N.pkl") so
+        it can be passed straight back to --resume-from.
+        """
         name = f"step_{step}.pkl"
-        path = Path(REMOTE_CKPT_DIR) / name
+        rel = f"{run_id}/{name}"
+        path = Path(REMOTE_CKPT_DIR) / run_id / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "step": step,
             "config": config,
+            "run_id": run_id,
             "params": _tree_to_numpy(params),
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
         ckpt_vol.commit()
-        print(f"  checkpoint saved: {name}")
-        return name
+        print(f"  checkpoint saved: {rel}")
+        return rel
 
     # --- warmup step: compile + fail-fast on a broken setup ---
     inputs, targets = next(batches)
@@ -378,7 +432,10 @@ def run_train(
     gpu_sampler = _GpuSampler(gpu_sample_ms)
     gpu_sampler.start()
     t0 = time.perf_counter()
-    last_log_t, last_log_step = t0, 0
+    # Init the log cursor at start_step (not 0) so the first interval's tok/s and
+    # MFU count only steps run THIS process — otherwise a resumed run reports a
+    # spurious start_step-sized burst on its first log line (and a garbage peak).
+    last_log_t, last_log_step = t0, start_step
     peak_mfu = 0.0
 
     for step in range(start_step + 1, start_step + n_steps + 1):
@@ -434,6 +491,7 @@ def run_train(
 
     return {
         "config": config,
+        "run_id": run_id,
         "n_params": n_params,
         "batch_size": batch_size,
         "seq_len": cfg.seq_len,
@@ -477,7 +535,13 @@ def main(
     use_remat: bool = True,
     use_pallas_norm: bool = False,
     gpu_sample_ms: int = 500,
+    run_id: str = "",
 ):
+    # Stamp the run id locally so it appears in the launcher output and the whole
+    # run (including any logs before the remote function prints) shares one id.
+    run_id = run_id or _make_run_id()
+    print(f"launching run_id: {run_id}  "
+          f"(checkpoints isolated under volume '{CKPT_VOLUME_NAME}'/{run_id}/)")
     r = run_train.remote(
         config=config,
         batch_size=batch_size,
@@ -497,10 +561,12 @@ def main(
         use_remat=use_remat,
         use_pallas_norm=use_pallas_norm,
         gpu_sample_ms=gpu_sample_ms,
+        run_id=run_id,
     )
 
     print(f"\n{'─' * 60}")
     print(f"  config      : {r['config']}  ({r['n_params']:,} params)")
+    print(f"  run_id      : {r['run_id']}")
     print(f"  batch       : {r['batch_size']}  seq_len {r['seq_len']}")
     print(f"  device      : {r['device']}  ({r['device_kind']})")
     print(f"  peak ref    : {r['peak_tflops']:,.0f} TFLOP/s  (BF16 dense)")
@@ -537,6 +603,9 @@ def main(
         print(f"  checkpoint  : {r['final_checkpoint']}  "
               f"(volume '{CKPT_VOLUME_NAME}')")
     print(f"{'─' * 60}")
-    print(f"\n  download checkpoint with:")
-    print(f"    modal volume get {CKPT_VOLUME_NAME} "
-          f"{r['final_checkpoint'] or 'step_<N>.pkl'} ./")
+    if r["final_checkpoint"]:
+        print(f"\n  download checkpoint with:")
+        print(f"    modal volume get {CKPT_VOLUME_NAME} "
+              f"{r['final_checkpoint']} ./")
+        print(f"\n  resume this run with:")
+        print(f"    modal run train_modal.py --resume-from {r['final_checkpoint']}")

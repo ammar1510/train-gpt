@@ -77,15 +77,22 @@ def _build_gpu_rms_norm():
 
         scale_2d = scale[None, :]                  # (1, D)
 
+        # BlockSpec index_maps return BLOCK indices; Pallas multiplies each by the
+        # block_shape to get the element offset. So the column maps must return
+        # the *tile index* (p % N_TILES), NOT (p % N_TILES) * TILE_D — the latter
+        # is the element offset, which Pallas would multiply by TILE_D again,
+        # sending tiles 1..N_TILES-1 out of bounds (clamped to the last tile) and
+        # leaving the middle output columns unwritten → uninitialized → NaN. The
+        # row map (p // N_TILES) is unaffected because the block height is 1.
         out2d = pl.pallas_call(
             functools.partial(_norm_kernel, eps=eps),
             out_shape=jax.ShapeDtypeStruct(x2d.shape, x2d.dtype),
             in_specs=[
-                pl.BlockSpec((1, TILE_D), lambda p: (p // N_TILES, (p % N_TILES) * TILE_D)),  # x
-                pl.BlockSpec((1, TILE_D), lambda p: (0, (p % N_TILES) * TILE_D)),             # scale
-                pl.BlockSpec((1, 32),     lambda p: (p // N_TILES, 0)),                       # var
+                pl.BlockSpec((1, TILE_D), lambda p: (p // N_TILES, p % N_TILES)),  # x
+                pl.BlockSpec((1, TILE_D), lambda p: (0, p % N_TILES)),             # scale
+                pl.BlockSpec((1, 32),     lambda p: (p // N_TILES, 0)),            # var
             ],
-            out_specs=pl.BlockSpec((1, TILE_D), lambda p: (p // N_TILES, (p % N_TILES) * TILE_D)),
+            out_specs=pl.BlockSpec((1, TILE_D), lambda p: (p // N_TILES, p % N_TILES)),
             grid=(N * N_TILES,),
         )(x2d, scale_2d, var32)
 
